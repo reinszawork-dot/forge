@@ -12,11 +12,24 @@ const blank = () => ({
   workouts: [],
   active: null,
   weights: [],
-  settings: { restSec: 90 },
+  settings: { restSec: 90, deloadEvery: 6, deloadUntil: 0, deloadDismissed: 0 },
+  reminders: { days: [], time: '17:30', foodTime: '' },
+  meta: { updatedAt: 0 },
 });
+function hydrate(data) {
+  const b = blank(), s = Object.assign(b, data || {});
+  s.settings = { ...b.settings, ...(data?.settings || {}) };
+  s.reminders = { ...b.reminders, ...(data?.reminders || {}) };
+  s.meta = { ...b.meta, ...(data?.meta || {}) };
+  return s;
+}
 let state;
-try { state = Object.assign(blank(), JSON.parse(localStorage.getItem(KEY)) || {}); } catch { state = blank(); }
-const save = () => { try { localStorage.setItem(KEY, JSON.stringify(state)); } catch { /* storage full or blocked */ } };
+try { state = hydrate(JSON.parse(localStorage.getItem(KEY))); } catch { state = blank(); }
+function save(touch = true) {
+  if (touch) state.meta.updatedAt = Date.now();
+  try { localStorage.setItem(KEY, JSON.stringify(state)); } catch { /* storage full or blocked */ }
+  if (touch) scheduleSync();
+}
 
 let tab = 'today';
 let eatDate = null; // date key shown in Eat tab
@@ -111,19 +124,67 @@ function bestE1RM(exId) {
   for (const w of state.workouts) for (const e of w.exercises) if (e.exId === exId) for (const s of e.sets) best = Math.max(best, e1rm(s.w, s.r));
   return best;
 }
-function suggestion(exId) {
-  // Double progression: work up to 12 reps, then add load and drop to 8.
-  const last = lastSession(exId);
-  if (!last) return null;
+/* Effort (RPE): how close to failure a set was. 10 = nothing left. */
+const RPE = [null, 7, 8, 9, 10];
+const RPE_LABEL = { 7: ['😌', 'Easy — 3+ reps left'], 8: ['🙂', 'Solid — 2 reps left'], 9: ['😤', 'Hard — 1 rep left'], 10: ['💀', 'Max — nothing left'] };
+const roundW = (w, step = 1.25) => Math.round(w / step) * step;
+const sessionsFor = (exId) => state.workouts.filter((w) => w.exercises.some((e) => e.exId === exId))
+  .map((w) => w.exercises.filter((e) => e.exId === exId).flatMap((e) => e.sets));
+const deloadActive = () => state.settings.deloadUntil > Date.now();
+
+function suggestion(exId, opts = {}) {
+  // Double progression (8→12 reps, then add load), tuned by effort, stalls, deloads and rough days.
+  const sessions = sessionsFor(exId);
+  const last = sessions[sessions.length - 1];
+  if (!last || !last.length) return null;
   const ex = exById(exId);
   const topW = Math.max(...last.map((s) => s.w));
   const minR = Math.min(...last.map((s) => s.r));
-  if (ex.type === 'b' && topW === 0) return { w: 0, r: minR + 1, sets: last.length, note: `Beat last time: aim for ${minR + 1}+ reps` };
-  if (minR >= 12) {
-    const inc = ex.type === 'i' ? 1.25 : ['Legs', 'Glutes'].includes(ex.muscle) || exId === 'deadlift' ? 5 : 2.5;
-    return { w: topW + inc, r: 8, sets: last.length, note: `You hit 12s — go up to ${topW + inc} kg × 8` };
+  const rpes = last.map((s) => s.rpe).filter(Boolean);
+  const avgRpe = rpes.length ? rpes.reduce((a, b) => a + b, 0) / rpes.length : null;
+  const n = last.length;
+  const inc = ex.type === 'i' ? 1.25 : ['Legs', 'Glutes'].includes(ex.muscle) || exId === 'deadlift' ? 5 : 2.5;
+
+  if (deloadActive()) {
+    return { w: topW ? roundW(topW * 0.85) : 0, r: minR, sets: Math.max(1, Math.ceil(n / 2)), tag: 'deload', note: `Deload week: ${topW ? roundW(topW * 0.85) + ' kg' : 'bodyweight'} × ${minR}, half the sets. Recover, then come back stronger.` };
   }
-  return { w: topW, r: minR + 1, sets: last.length, note: `Same weight, add a rep: ${topW} kg × ${minR + 1}` };
+  if (opts.easyDay) {
+    return { w: topW ? roundW(topW * 0.9) : 0, r: minR, sets: n, tag: 'easy', note: `Rough day: ${topW ? roundW(topW * 0.9) + ' kg' : 'same'} × ${minR}. Showing up is the win today.` };
+  }
+  // Stall: no e1RM improvement across the last 3 sessions → small reset.
+  if (sessions.length >= 3 && topW > 0) {
+    const best = (ss) => Math.max(...ss.map((s) => e1rm(s.w, s.r)));
+    const [a, b, c] = sessions.slice(-3).map(best);
+    if (b <= a + 0.01 && c <= a + 0.01) {
+      const w = roundW(topW * 0.9);
+      return { w, r: Math.min(minR + 2, 12), sets: n, tag: 'stall', note: `Stuck for 3 sessions. Reset to ${w} kg × ${Math.min(minR + 2, 12)} and build back past it.` };
+    }
+  }
+  if (ex.type === 'b' && topW === 0) {
+    const add = avgRpe && avgRpe <= 7 ? 2 : 1;
+    return { w: 0, r: minR + add, sets: n, note: `Beat last time: aim for ${minR + add}+ reps` };
+  }
+  if (minR >= 12) {
+    const jump = avgRpe && avgRpe <= 7 ? inc * 2 : inc;
+    const w = topW + jump;
+    return { w, r: 8, sets: n, tag: 'up', note: `You hit 12s${jump > inc ? ' with room to spare' : ''}. Go up to ${w} kg × 8` };
+  }
+  if (avgRpe && avgRpe >= 9.5) return { w: topW, r: minR, sets: n, note: `Last time was all-out. Match ${topW} kg × ${minR} with better form first.` };
+  const add = avgRpe && avgRpe <= 7 ? 2 : 1;
+  return { w: topW, r: Math.min(minR + add, 12), sets: n, note: `Same weight, add ${add > 1 ? 'reps' : 'a rep'}: ${topW} kg × ${Math.min(minR + add, 12)}` };
+}
+
+/* Deload check: N straight weeks of training since the last deload → suggest one. */
+function deloadDue() {
+  const every = state.settings.deloadEvery;
+  if (!every || deloadActive() || !state.workouts.length) return false;
+  const since = Math.max(state.settings.deloadUntil, state.settings.deloadDismissed);
+  const mon = (t) => { const d = new Date(t); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); return +d; };
+  const weeks = new Set(state.workouts.filter((w) => w.start > since).map((w) => mon(w.start)));
+  let streak = 0, wk = mon(Date.now());
+  if (!weeks.has(wk)) wk -= 7 * 864e5;
+  while (weeks.has(wk)) { streak++; wk = mon(wk - 3 * 864e5); }
+  return streak >= every;
 }
 const volume = (w) => w.exercises.reduce((a, e) => a + e.sets.reduce((b, s) => b + s.w * s.r, 0), 0);
 const setCount = (w) => w.exercises.reduce((a, e) => a + e.sets.length, 0);
@@ -149,6 +210,7 @@ let sheetCloseT = 0;
 function openSheet(html, mount) {
   const sheet = $('#sheet'), bd = $('#sheetBackdrop');
   clearTimeout(sheetCloseT);
+  stopScan(); // never leave the camera running behind another sheet
   // Fresh element each time so listeners from a previous sheet never leak.
   const old = $('#sheetBody'), body = old.cloneNode(false);
   old.replaceWith(body);
@@ -159,6 +221,7 @@ function openSheet(html, mount) {
 }
 function closeSheet() {
   const sheet = $('#sheet'), bd = $('#sheetBackdrop');
+  stopScan();
   if (sheet.hidden) return;
   sheet.classList.add('closing'); bd.classList.add('closing');
   sheetCloseT = setTimeout(() => { sheet.hidden = true; bd.hidden = true; $('#sheetBody').innerHTML = ''; }, 240);
@@ -373,6 +436,9 @@ function viewToday() {
       <div class="meal-head"><h3>This week</h3><span class="chip accent">${weekCount} workout${weekCount === 1 ? '' : 's'}</span></div>
       <div class="week">${week.map((d, i) => `<div>${'MTWTFSS'[i]}<i style="--d:${i}" class="${wd.has(dkey(d)) ? 'on' : ''} ${dkey(d) === k ? 'today' : ''}"></i></div>`).join('')}</div>
     </section>
+    ${deloadActive() ? `<section class="card banner" style="margin-top:12px"><span style="font-size:28px">🧘</span><div class="grow"><b>Deload week</b><div class="muted" style="font-size:13px">Lighter weights, half the sets, until ${fmtDate(state.settings.deloadUntil, { weekday: 'long' })}. Recovery is when you grow.</div></div><button class="btn small" data-deload="end">End</button></section>`
+      : deloadDue() ? `<section class="card banner pulse-border" style="margin-top:12px"><span style="font-size:28px">🔋</span><div class="grow"><b>Time for a deload?</b><div class="muted" style="font-size:13px">${state.settings.deloadEvery} straight weeks of training. An easy week lets your joints and nervous system recover.</div></div><div style="display:flex;flex-direction:column;gap:6px"><button class="btn small primary" data-deload="start">Start</button><button class="btn small" data-deload="skip">Not now</button></div></section>` : ''}
+    ${!sync.token && (state.workouts.length >= 3 || Object.keys(state.diary).length >= 5) && Date.now() - lastExport() > 7 * 864e5 ? `<button class="item" id="bkNudge" style="margin-top:12px"><div class="badge">☁️</div><div class="grow"><div class="title">Protect your progress</div><div class="meta">Your data lives only on this phone. Turn on cloud backup.</div></div><span class="muted">›</span></button>` : ''}
     <div class="section-title"><h2>Train</h2><button class="link" data-go="train">All routines</button></div>
     ${state.active
       ? `<button class="btn primary block shine" data-go="train">▶ Continue ${esc(state.active.name)}</button>`
@@ -386,6 +452,14 @@ binders.today = () => {
   for (const b of $$('[data-go]')) b.onclick = () => setTab(b.dataset.go);
   for (const b of $$('[data-start]')) b.onclick = () => startWorkout(state.routines.find((r) => r.id === b.dataset.start));
   for (const b of $$('[data-empty]')) b.onclick = () => startWorkout(null);
+  for (const b of $$('[data-deload]')) b.onclick = () => {
+    const act = b.dataset.deload;
+    if (act === 'start') { state.settings.deloadUntil = Date.now() + 7 * 864e5; toast('🧘 Deload week started. Targets are lighter for 7 days.'); }
+    if (act === 'end') { state.settings.deloadUntil = 0; state.settings.deloadDismissed = Date.now(); toast('Deload ended. Back to normal targets.'); }
+    if (act === 'skip') { state.settings.deloadDismissed = Date.now(); toast('OK, we’ll check again in a few weeks'); }
+    save(); render(false);
+  };
+  const nudge = $('#bkNudge'); if (nudge) nudge.onclick = backupSheet;
   bindWater(dkey());
 };
 function nextRoutine() {
@@ -424,7 +498,7 @@ binders.train = () => {
 };
 
 function newExerciseEntry(exId) {
-  const sug = suggestion(exId);
+  const sug = suggestion(exId, { easyDay: state.active?.easyDay });
   const n = sug ? sug.sets : 3;
   return { exId, sets: Array.from({ length: n }, () => ({ w: '', r: '', done: false })) };
 }
@@ -452,27 +526,33 @@ function viewWorkout() {
         </div>
         <button class="btn primary" id="finishBtn">Finish</button>
       </div>
+      <div class="row" style="margin-top:10px;align-items:center">
+        ${deloadActive() ? '<span class="chip accent" style="flex:none">🧘 Deload week</span>' : `<button class="btn small ${a.easyDay ? 'on-soft' : ''}" id="easyBtn" style="flex:none">😴 ${a.easyDay ? 'Rough day on' : 'Rough day?'}</button>`}
+        <small class="muted" style="text-align:right">Rate sets with <b>Feel</b> for smarter suggestions</small>
+      </div>
     </section>
     ${a.exercises.map((e, i) => exerciseCard(e, i)).join('')}
     <button class="btn block" id="addExBtn" style="margin-top:12px">＋ Add exercise</button>
     <button class="btn block danger" id="cancelWk" style="margin-top:8px;background:none;border-color:transparent">Discard workout</button>`;
 }
+const TAG_ICON = { deload: '🧘', easy: '😴', stall: '🔁', up: '🚀' };
 function exerciseCard(e, i) {
-  const ex = exById(e.exId), prev = lastSession(e.exId), sug = suggestion(e.exId);
+  const ex = exById(e.exId), prev = lastSession(e.exId), sug = suggestion(e.exId, { easyDay: state.active.easyDay });
   return `<section class="card ex-card" style="--i:${i}" data-exi="${i}">
     <div class="ex-head">
-      <div><h3>${esc(ex.name)}</h3>${sug ? `<div class="suggest">🔮 ${esc(sug.note)}</div>` : `<div class="suggest muted">First time — find a weight you can do for 8–12 clean reps</div>`}</div>
+      <div><h3>${esc(ex.name)} <button class="info-btn" data-guide="${esc(e.exId)}" aria-label="How to do ${esc(ex.name)}">i</button></h3>${sug ? `<div class="suggest ${sug.tag || ''}">${TAG_ICON[sug.tag] || '🔮'} ${esc(sug.note)}</div>` : `<div class="suggest muted">First time — find a weight you can do for 8–12 clean reps</div>`}</div>
       <button class="btn small" data-rmex="${i}" aria-label="Remove exercise">✕</button>
     </div>
     <table class="sets">
-      <thead><tr><th>Set</th><th>Prev</th><th>kg</th><th>Reps</th><th></th></tr></thead>
+      <thead><tr><th>Set</th><th>Prev</th><th>kg</th><th>Reps</th><th title="How hard was it?">Feel</th><th></th></tr></thead>
       <tbody>${e.sets.map((s, j) => {
         const p = prev && prev[j];
         return `<tr class="${s.done ? 'done' : ''}" data-row="${i}-${j}">
           <td><b>${j + 1}</b>${s.pr ? '<span class="pr-flag">PR</span>' : ''}</td>
           <td class="prev">${p ? `${p.w}×${p.r}` : '—'}</td>
-          <td><input inputmode="decimal" data-f="w" data-i="${i}" data-j="${j}" value="${esc(s.w)}" placeholder="${sug ? sug.w : ''}"></td>
-          <td><input inputmode="numeric" data-f="r" data-i="${i}" data-j="${j}" value="${esc(s.r)}" placeholder="${sug ? sug.r : ''}"></td>
+          <td><input inputmode="decimal" data-f="w" data-i="${i}" data-j="${j}" value="${esc(s.w)}" placeholder="${sug ? sug.w : ''}" aria-label="Weight in kg"></td>
+          <td><input inputmode="numeric" data-f="r" data-i="${i}" data-j="${j}" value="${esc(s.r)}" placeholder="${sug ? sug.r : ''}" aria-label="Reps"></td>
+          <td><button class="feel" data-rpe="${i}-${j}" aria-label="Effort: ${s.rpe ? RPE_LABEL[s.rpe][1] : 'not rated'}" title="${s.rpe ? RPE_LABEL[s.rpe][1] : 'Tap to rate effort'}">${s.rpe ? RPE_LABEL[s.rpe][0] : '·'}</button></td>
           <td><button class="check ${s.done ? 'on' : ''}" data-check="${i}-${j}" aria-label="Complete set">${CHECK}</button></td>
         </tr>`;
       }).join('')}</tbody>
@@ -489,6 +569,23 @@ function bindWorkout() {
     state.active = null; stopRest(); save(); render();
   };
   $('#addExBtn').onclick = () => exercisePicker('Add exercises', (ids) => { ids.forEach((id) => a.exercises.push(newExerciseEntry(id))); save(); render(false); setTimeout(() => $('#addExBtn').scrollIntoView({ behavior: 'smooth', block: 'center' }), 50); });
+  const easy = $('#easyBtn');
+  if (easy) easy.onclick = () => {
+    a.easyDay = !a.easyDay; save();
+    // Re-fill the placeholders on sets not yet started
+    render(false);
+    toast(a.easyDay ? 'Lighter targets today. Still counts 💪' : 'Back to normal targets');
+  };
+  for (const b of $$('[data-guide]')) b.onclick = () => guideSheet(b.dataset.guide);
+  for (const b of $$('[data-rpe]')) b.onclick = () => {
+    const [i, j] = b.dataset.rpe.split('-').map(Number), s = a.exercises[i].sets[j];
+    s.rpe = RPE[(RPE.indexOf(s.rpe ?? null) + 1) % RPE.length];
+    b.textContent = s.rpe ? RPE_LABEL[s.rpe][0] : '·';
+    b.title = s.rpe ? RPE_LABEL[s.rpe][1] : 'Tap to rate effort';
+    b.classList.remove('bump'); void b.offsetWidth; b.classList.add('bump');
+    if (s.rpe) toast(RPE_LABEL[s.rpe][1]);
+    save();
+  };
   for (const inp of $$('.sets input')) inp.oninput = () => { a.exercises[+inp.dataset.i].sets[+inp.dataset.j][inp.dataset.f] = inp.value; save(); };
   for (const b of $$('[data-check]')) b.onclick = () => toggleSet(...b.dataset.check.split('-').map(Number), b);
   for (const b of $$('[data-addset]')) b.onclick = () => { const ex = a.exercises[+b.dataset.addset]; const last = ex.sets[ex.sets.length - 1]; ex.sets.push({ w: last ? last.w : '', r: last ? last.r : '', done: false }); save(); render(false); };
@@ -523,7 +620,7 @@ function toggleSet(i, j, btn) {
 }
 function finishWorkout() {
   const a = state.active;
-  const exercises = a.exercises.map((e) => ({ exId: e.exId, sets: e.sets.filter((s) => s.done).map((s) => ({ w: num(s.w), r: num(s.r), ...(s.pr ? { pr: true } : {}) })) })).filter((e) => e.sets.length);
+  const exercises = a.exercises.map((e) => ({ exId: e.exId, sets: e.sets.filter((s) => s.done).map((s) => ({ w: num(s.w), r: num(s.r), ...(s.rpe ? { rpe: s.rpe } : {}), ...(s.pr ? { pr: true } : {}) })) })).filter((e) => e.sets.length);
   if (!exercises.length) { if (confirm('No completed sets. Discard this workout?')) { state.active = null; stopRest(); save(); render(); } return; }
   const w = { id: a.id, name: a.name, routineId: a.routineId, start: a.start, end: Date.now(), exercises };
   state.workouts.push(w); state.active = null; stopRest(); save();
@@ -581,20 +678,23 @@ function exercisePicker(title, onDone, preselected = []) {
   const picked = new Set(preselected);
   let q = '', muscle = 'All';
   const muscles = ['All', ...new Set(allExercises().map((e) => e.muscle))];
-  openSheet(`<h2>${esc(title)}</h2>
-    <input class="search" id="exQ" placeholder="Search ${allExercises().length} exercises…" autocomplete="off">
-    <div class="filters" id="exF">${muscles.map((m) => `<button data-m="${esc(m)}" class="${m === 'All' ? 'on' : ''}">${esc(m)}</button>`).join('')}</div>
+  const show = () => openSheet(`<h2>${esc(title)}</h2>
+    <input class="search" id="exQ" placeholder="Search ${allExercises().length} exercises…" autocomplete="off" value="${esc(q)}">
+    <div class="filters" id="exF">${muscles.map((m) => `<button data-m="${esc(m)}" class="${m === muscle ? 'on' : ''}">${esc(m)}</button>`).join('')}</div>
     <div class="list" id="exL"></div>
     <button class="btn primary block" id="exGo" style="position:sticky;bottom:0;margin-top:12px">Add</button>`, (b) => {
     const list = $('#exL', b), go = $('#exGo', b);
     const draw = () => {
       const ql = q.trim().toLowerCase();
       const rows = allExercises().filter((e) => (muscle === 'All' || e.muscle === muscle) && (!ql || e.name.toLowerCase().includes(ql)));
-      list.innerHTML = rows.map((e, i) => `<button class="item" style="--i:${Math.min(i, 12)}" data-id="${esc(e.id)}"><div class="badge" style="${picked.has(e.id) ? 'background:var(--accent);color:var(--accent-ink)' : ''}">${picked.has(e.id) ? '✓' : esc(e.name[0])}</div><div class="grow"><div class="title">${esc(e.name)}</div><div class="meta">${esc(e.muscle)} · ${esc(e.equip)}</div></div></button>`).join('')
+      list.innerHTML = rows.map((e, i) => `<div class="item" role="button" tabindex="0" style="--i:${Math.min(i, 12)}" data-id="${esc(e.id)}"><div class="badge" style="${picked.has(e.id) ? 'background:var(--accent);color:var(--accent-ink)' : ''}">${picked.has(e.id) ? '✓' : esc(e.name[0])}</div><div class="grow"><div class="title">${esc(e.name)}</div><div class="meta">${esc(e.muscle)} · ${esc(e.equip)}</div></div>${GUIDES[e.id] ? `<button class="info-btn" data-guide="${esc(e.id)}" aria-label="How to do ${esc(e.name)}">i</button>` : ''}</div>`).join('')
         + (ql && !rows.some((e) => e.name.toLowerCase() === ql) ? `<button class="item" data-create><div class="badge">＋</div><div class="grow"><div class="title">Create “${esc(q.trim())}”</div><div class="meta">Custom exercise</div></div></button>` : '');
       go.textContent = picked.size ? `Add ${picked.size} exercise${picked.size > 1 ? 's' : ''}` : 'Done';
     };
+    list.onkeydown = (e) => { if ((e.key === 'Enter' || e.key === ' ') && e.target.matches('.item')) { e.preventDefault(); e.target.click(); } };
     list.onclick = (e) => {
+      const g = e.target.closest('[data-guide]');
+      if (g) return guideSheet(g.dataset.guide, show);
       const it = e.target.closest('.item'); if (!it) return;
       if (it.hasAttribute('data-create')) {
         const ex = { id: 'c-' + uid(), name: q.trim(), muscle: muscle === 'All' ? 'Other' : muscle, equip: 'Custom', type: 'c' };
@@ -606,6 +706,27 @@ function exercisePicker(title, onDone, preselected = []) {
     $('#exF', b).onclick = (e) => { const m = e.target.dataset.m; if (!m) return; muscle = m; $$('#exF button', b).forEach((x) => x.classList.toggle('on', x.dataset.m === m)); draw(); };
     go.onclick = () => { const ids = [...picked].filter((id) => !preselected.includes(id)); closeSheet(); onDone(preselected.length ? [...picked] : ids); };
     draw();
+  });
+  show();
+}
+
+function guideSheet(exId, onBack) {
+  const ex = exById(exId), g = GUIDES[exId];
+  const best = bestE1RM(exId), last = lastSession(exId), sug = suggestion(exId);
+  const yt = `https://www.youtube.com/results?search_query=${encodeURIComponent(ex.name + ' proper form')}`;
+  openSheet(`${onBack ? '<button class="link" id="gBack" style="margin-bottom:8px">‹ Back</button>' : ''}
+    <h2>${esc(ex.name)}</h2>
+    <div class="filters" style="padding-top:0">${g ? `<span class="chip accent">${esc(g[0])}</span>${g[1] !== '—' ? `<span class="chip">${esc(g[1])}</span>` : ''}` : `<span class="chip">${esc(ex.muscle)}</span>`}<span class="chip">${esc(ex.equip)}</span></div>
+    ${g ? `<ol class="cues">${g[2].map((c, i) => `<li style="--i:${i}">${esc(c)}</li>`).join('')}</ol>
+      <div class="mistake"><b>⚠️ Common mistake</b><br>${esc(g[3])}</div>` : '<p class="muted">Custom exercise: no guide yet.</p>'}
+    <a class="btn block" href="${yt}" target="_blank" rel="noopener" style="margin-top:14px;text-decoration:none">▶ Watch a form video</a>
+    <div class="summary-stats">
+      <div><b>${best ? round(best, 1) : '—'}</b><span>best est. 1RM</span></div>
+      <div><b>${last ? last.map((s) => s.w).reduce((a, b) => Math.max(a, b), 0) + '×' + last[0].r : '—'}</b><span>last top set</span></div>
+      <div><b>${sessionsFor(exId).length}</b><span>sessions</span></div>
+    </div>
+    ${sug ? `<p class="suggest" style="font-size:13px">${TAG_ICON[sug.tag] || '🔮'} Next time: ${esc(sug.note)}</p>` : ''}`, (b) => {
+    const back = $('#gBack', b); if (back) back.onclick = onBack;
   });
 }
 
@@ -678,10 +799,33 @@ function foodSheet(k, meal) {
   const mealName = MEALS.find(([m]) => m === meal)[1];
   let mode = 'search';
   const draw = () => openSheet(`<h2>Add to ${mealName}</h2>
-    <div class="seg" id="fMode"><button data-mode="search" class="${mode === 'search' ? 'on' : ''}">Foods</button><button data-mode="online" class="${mode === 'online' ? 'on' : ''}">Online</button><button data-mode="quick" class="${mode === 'quick' ? 'on' : ''}">Quick add</button><button data-mode="create" class="${mode === 'create' ? 'on' : ''}">Create</button></div>
+    <div class="seg" id="fMode">${[['search', 'Foods'], ['scan', 'Scan'], ['online', 'Online'], ['quick', 'Quick'], ['create', 'Create']].map(([m, l]) => `<button data-mode="${m}" class="${mode === m ? 'on' : ''}">${l}</button>`).join('')}</div>
     <div id="fBody" style="margin-top:12px"></div>`, (b) => {
     $('#fMode', b).onclick = (e) => { if (e.target.dataset.mode) { mode = e.target.dataset.mode; draw(); } };
     const body = $('#fBody', b);
+    if (mode === 'scan') {
+      body.innerHTML = `<div class="scan-box"><video id="scanV" playsinline muted autoplay></video><div class="scan-line"></div><div class="scan-msg" id="scanMsg">Starting camera…</div></div>
+        <form id="bcF" class="row" style="margin-top:12px"><input class="search" id="bcQ" inputmode="numeric" placeholder="Or type the barcode number" autocomplete="off"><button class="btn primary" style="flex:none">Look up</button></form>
+        <p class="muted" style="font-size:12px">Barcode data comes from Open Food Facts. SA products are hit-and-miss: if one isn’t found, use Quick or Create.</p>`;
+      const msg = $('#scanMsg', body);
+      let busy = false;
+      const handle = async (code) => {
+        if (busy) return; busy = true;
+        buzz(30); beep(1200, 0.08);
+        msg.textContent = `Found ${code}, looking it up…`; msg.hidden = false;
+        try {
+          const food = await lookupBarcode(code);
+          if (food) { stopScan(); portionSheet(k, meal, food); return; }
+          msg.textContent = `No product found for ${code}. Try Quick add or Create.`;
+        } catch { msg.textContent = 'Couldn’t reach Open Food Facts. Check your connection.'; }
+        setTimeout(() => { busy = false; }, 2500);
+      };
+      $('#bcF', body).onsubmit = (e) => { e.preventDefault(); const c = $('#bcQ', body).value.replace(/\D/g, ''); if (c.length >= 8) handle(c); else toast('Barcodes are 8–14 digits'); };
+      startScanner($('#scanV', body), handle)
+        .then(() => { msg.hidden = true; })
+        .catch((err) => { msg.textContent = err && err.name === 'NotAllowedError' ? 'Camera access was blocked. Allow it in your browser settings, or type the number below.' : 'No camera available here. Type the barcode number below.'; });
+      return;
+    }
     if (mode === 'search') {
       body.innerHTML = `<input class="search" id="fQ" placeholder="Search foods (try “biltong”)" autocomplete="off"><div class="list" id="fL" style="margin-top:10px"></div>`;
       const list = $('#fL', body);
@@ -696,22 +840,24 @@ function foodSheet(k, meal) {
       drawList('');
     } else if (mode === 'online') {
       body.innerHTML = `<form id="oF" class="row"><input class="search" id="oQ" placeholder="Search packaged foods (e.g. Woolworths yoghurt)" autocomplete="off"><button class="btn primary" style="flex:none">Search</button></form>
-        <p class="muted" style="font-size:12px">Powered by Open Food Facts — a free, crowd-sourced database. Values are per 100 g.</p><div class="list" id="oL"></div>`;
+        <label class="muted" style="display:flex;gap:8px;align-items:center;font-size:13px;margin:10px 2px"><input type="checkbox" id="oSA" checked style="width:18px;height:18px;accent-color:var(--accent)"> 🇿🇦 South African products first</label>
+        <p class="muted" style="font-size:12px">Powered by Open Food Facts, a free, crowd-sourced database. Values are per 100 g.</p><div class="list" id="oL"></div>`;
       $('#oF', body).onsubmit = async (e) => {
         e.preventDefault();
         const q = $('#oQ', body).value.trim(), list = $('#oL', body);
         if (!q) return;
         list.innerHTML = '<p class="empty">Searching…</p>';
         try {
-          const url = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(q)}&search_simple=1&action=process&json=1&page_size=25&fields=product_name,brands,nutriments`;
-          const res = await fetch(url); const data = await res.json();
-          const rows = (data.products || []).filter((p) => p.product_name && p.nutriments && p.nutriments['energy-kcal_100g'] != null).map((p) => ({
-            name: p.product_name + (p.brands ? ` (${p.brands.split(',')[0]})` : ''), serving: '100 g', per100: true,
-            kcal: Math.round(p.nutriments['energy-kcal_100g']), p: round(p.nutriments.proteins_100g || 0, 1), c: round(p.nutriments.carbohydrates_100g || 0, 1), f: round(p.nutriments.fat_100g || 0, 1),
-          }));
-          list.innerHTML = rows.map((f, i) => `<button class="item" style="--i:${i}" data-i="${i}"><div class="grow"><div class="title">${esc(f.name)}</div><div class="meta">per 100 g · P${f.p} C${f.c} F${f.f}</div></div><span class="chip kcal">${f.kcal} kcal</span></button>`).join('') || '<p class="empty">Nothing found.</p>';
+          let rows = $('#oSA', body).checked ? await offSearch(q, true, (m) => (list.innerHTML = `<p class="empty">${m}</p>`)) : [];
+          if (rows.length < 3) {
+            const more = await offSearch(q, false, (m) => (list.innerHTML = `<p class="empty">${m}</p>`));
+            const seen = new Set(rows.map((r) => r.name)); rows = rows.concat(more.filter((r) => !seen.has(r.name)));
+          }
+          list.innerHTML = rows.map((f, i) => `<button class="item" style="--i:${Math.min(i, 12)}" data-i="${i}"><div class="grow"><div class="title">${esc(f.name)}</div><div class="meta">per 100 g · P${f.p} C${f.c} F${f.f}</div></div><span class="chip kcal">${f.kcal} kcal</span></button>`).join('') || '<p class="empty">Nothing found. Try fewer words, the Scan tab, or Create.</p>';
           list.onclick = (ev) => { const it = ev.target.closest('[data-i]'); if (it) portionSheet(k, meal, rows[+it.dataset.i]); };
-        } catch { list.innerHTML = '<p class="empty">Couldn’t reach Open Food Facts — are you offline?</p>'; }
+        } catch (err) {
+          list.innerHTML = `<p class="empty">${!navigator.onLine ? 'You’re offline. Online search needs a connection.' : 'Open Food Facts is busy right now (it limits searches). Wait 30 seconds and try again, or use Scan.'}</p>`;
+        }
       };
     } else if (mode === 'quick') {
       body.innerHTML = `<div class="field"><label>Name (optional)</label><input id="qN" placeholder="Quick add"></div>
@@ -739,10 +885,87 @@ function foodSheet(k, meal) {
   });
   draw();
 }
+/* ---------- barcode scanning ---------- */
+const ZXING_URL = 'https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js';
+let scanCleanup = null, scanGen = 0;
+const stopScan = () => { scanGen++; if (scanCleanup) { try { scanCleanup(); } catch { /* ignore */ } scanCleanup = null; } };
+function loadScript(src) {
+  return new Promise((res, rej) => {
+    if ([...document.scripts].some((s) => s.src === src)) return res();
+    const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = rej; document.head.appendChild(s);
+  });
+}
+async function startScanner(video, onCode) {
+  stopScan();
+  const gen = scanGen;
+  if (!navigator.mediaDevices?.getUserMedia) throw new Error('no camera');
+  const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 } }, audio: false });
+  if (gen !== scanGen) { stream.getTracks().forEach((t) => t.stop()); return; } // sheet changed while the camera was opening
+  let stopped = false, reader = null;
+  scanCleanup = () => { stopped = true; try { reader && reader.reset(); } catch { /* ignore */ } stream.getTracks().forEach((t) => t.stop()); };
+  video.srcObject = stream;
+  await video.play().catch(() => {});
+  let native = null;
+  if ('BarcodeDetector' in window) {
+    try {
+      const want = ['ean_13', 'ean_8', 'upc_a', 'upc_e'];
+      const have = await BarcodeDetector.getSupportedFormats();
+      const formats = want.filter((f) => have.includes(f));
+      if (formats.length) native = new BarcodeDetector({ formats });
+    } catch { native = null; }
+  }
+  if (native) {
+    const loop = async () => {
+      if (stopped) return;
+      try { const r = await native.detect(video); if (r[0]?.rawValue) onCode(r[0].rawValue); } catch { /* frame not ready */ }
+      setTimeout(loop, 200);
+    };
+    loop();
+  } else {
+    await loadScript(ZXING_URL);
+    if (stopped) return;
+    reader = new ZXing.BrowserMultiFormatReader();
+    reader.decodeFromStream(stream, video, (res) => { if (res && !stopped) onCode(res.getText()); }).catch(() => {});
+  }
+}
+/* Open Food Facts text search. Their server rate-limits and often answers 503 (with no CORS header,
+   so the browser reports it as a network error), so we retry with backoff. */
+async function offSearch(q, saOnly, onStatus) {
+  const url = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(q)}&search_simple=1&action=process&json=1&page_size=25&sort_by=unique_scans_n&fields=product_name,brands,nutriments`
+    + (saOnly ? '&tagtype_0=countries&tag_contains_0=contains&tag_0=south-africa' : '');
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt) { onStatus?.(`Open Food Facts is busy. Retrying (${attempt}/2)…`); await new Promise((r) => setTimeout(r, attempt * 2500)); }
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      return (data.products || []).filter((p) => p.product_name && p.nutriments && p.nutriments['energy-kcal_100g'] != null).map((p) => ({
+        name: p.product_name + (p.brands ? ` (${String(p.brands).split(',')[0]})` : ''), serving: '100 g', per100: true,
+        kcal: Math.round(p.nutriments['energy-kcal_100g']), p: round(p.nutriments.proteins_100g || 0, 1), c: round(p.nutriments.carbohydrates_100g || 0, 1), f: round(p.nutriments.fat_100g || 0, 1),
+      }));
+    } catch (e) { lastErr = e; if (!navigator.onLine) break; }
+  }
+  throw lastErr;
+}
+
+async function lookupBarcode(code) {
+  const res = await fetch(`https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(code)}.json?fields=product_name,brands,nutriments,serving_size,serving_quantity`);
+  if (res.status === 404) return null;
+  const j = await res.json();
+  const p = j.product, n = p?.nutriments;
+  if (!j.status || !p || !n || n['energy-kcal_100g'] == null) return null;
+  return {
+    name: (p.product_name || 'Scanned product') + (p.brands ? ` (${p.brands.split(',')[0]})` : ''), serving: '100 g', per100: true, barcode: code,
+    kcal: Math.round(n['energy-kcal_100g']), p: round(n.proteins_100g || 0, 1), c: round(n.carbohydrates_100g || 0, 1), f: round(n.fat_100g || 0, 1),
+    defaultQty: p.serving_quantity ? Math.round(+p.serving_quantity) : 100, servingLabel: p.serving_size || '',
+  };
+}
+
 function portionSheet(k, meal, food) {
-  const unit = food.per100 ? 'grams' : 'servings';
-  let qty = food.per100 ? 100 : 1;
-  openSheet(`<h2>${esc(food.name)}</h2><p class="muted" style="margin-top:-6px">${food.per100 ? 'Per 100 g' : esc(food.serving)}</p>
+  const unit = food.per100 ? 'grams (or ml)' : 'servings';
+  let qty = food.per100 ? (food.defaultQty || 100) : 1;
+  openSheet(`<h2>${esc(food.name)}</h2><p class="muted" style="margin-top:-6px">${food.per100 ? `${food.kcal} kcal per 100 g${food.servingLabel ? ` · 1 serving = ${esc(food.servingLabel)}` : ''}` : esc(food.serving)}</p>
     <div class="summary-stats" id="pS"></div>
     <div class="field"><label>How many ${unit}?</label>
       <div class="row" style="align-items:center"><button class="btn" id="pMinus" style="flex:none">−</button><input id="pQ" inputmode="decimal" value="${qty}" style="text-align:center;font:700 22px var(--display)"><button class="btn" id="pPlus" style="flex:none">+</button></div></div>
@@ -815,24 +1038,15 @@ function viewProgress() {
       ${done.length ? lineChart([{ pts: liftPts, color: 'var(--protein)', dots: true }], { yFmt: (v) => round(v) }) + '<p class="muted" style="font-size:12px;margin:6px 0 0">Estimated 1-rep max (Epley) — best set each session.</p>' : '<p class="empty">Finish a workout to start tracking strength.</p>'}
     </section>
     ${prs.length ? `<div class="section-title"><h2>Personal records</h2></div><div class="list">${prs.map((p, i) => `<div class="item" style="--i:${i}"><div class="badge" style="background:var(--carbs);color:#1b0d03">${i + 1}</div><div class="grow"><div class="title">${esc(exById(p.id).name)}</div><div class="meta">estimated 1RM</div></div><div class="right"><span data-count="${round(p.best, 1)}" data-dec="1">0</span> kg</div></div>`).join('')}</div>` : ''}
-    <div class="section-title"><h2>Data</h2></div>
-    <div class="row"><button class="btn" id="exportBtn">Export backup</button><button class="btn" id="importBtn">Import backup</button></div>`;
+    <div class="section-title"><h2>Your data</h2></div>
+    <button class="item" id="bkBtn"><div class="badge">☁️</div><div class="grow"><div class="title">Backup & sync</div><div class="meta">${sync.token ? (sync.error ? '⚠️ ' + esc(sync.error) : `Cloud backup on · synced ${ago(sync.lastOkAt)}`) : `Cloud backup off · last file backup ${ago(lastExport())}`}</div></div><span class="muted">›</span></button>
+    <button class="item" id="remBtn" style="margin-top:8px"><div class="badge">🔔</div><div class="grow"><div class="title">Reminders</div><div class="meta">${state.reminders.days.length ? state.reminders.days.slice().sort().map((d) => DAY_LABEL[d]).join(', ') + ' at ' + state.reminders.time : 'Off'}</div></div><span class="muted">›</span></button>`;
 }
 binders.progress = () => {
   $('#logW').onclick = weightSheet;
   const sel = $('#liftSel'); if (sel) sel.onchange = () => { progressEx = sel.value; render(false); };
-  $('#exportBtn').onclick = () => {
-    const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
-    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `forge-backup-${dkey()}.json`; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-  };
-  $('#importBtn').onclick = () => {
-    const inp = document.createElement('input'); inp.type = 'file'; inp.accept = 'application/json';
-    inp.onchange = async () => {
-      try { const data = JSON.parse(await inp.files[0].text()); if (!data || !Array.isArray(data.workouts)) throw 0; if (!confirm('Replace all current data with this backup?')) return; state = Object.assign(blank(), data); save(); render(); toast('Backup restored'); }
-      catch { toast('That file isn’t a Forge backup'); }
-    };
-    inp.click();
-  };
+  $('#bkBtn').onclick = backupSheet;
+  $('#remBtn').onclick = remindersSheet;
 };
 function weightSheet() {
   const last = latestWeight() || state.profile?.weight || 75;
@@ -850,6 +1064,218 @@ function weightSheet() {
   });
 }
 
+/* ---------- cloud backup: a private GitHub Gist ----------
+   The token lives only in this browser (separate key), never in backups or exports. */
+const SYNC_KEY = 'forge:sync', GIST_FILE = 'forge-backup.json';
+let sync = { token: '', gistId: '', lastSyncedAt: 0, lastOkAt: 0, error: '' };
+try { sync = { ...sync, ...JSON.parse(localStorage.getItem(SYNC_KEY)) }; } catch { /* fresh */ }
+const saveSync = () => { try { localStorage.setItem(SYNC_KEY, JSON.stringify(sync)); } catch { /* ignore */ } };
+const ago = (t) => { if (!t) return 'never'; const m = Math.round((Date.now() - t) / 60000); return m < 1 ? 'just now' : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} days ago`; };
+async function gh(path, opts = {}) {
+  const res = await fetch('https://api.github.com' + path, { ...opts, headers: { Authorization: `Bearer ${sync.token}`, Accept: 'application/vnd.github+json', ...(opts.body ? { 'Content-Type': 'application/json' } : {}) } });
+  if (res.status === 401) throw new Error('GitHub rejected the token. Make a new one with the “gist” box ticked.');
+  if (res.status === 403 || res.status === 404) throw new Error('The token can’t access gists. Tick the “gist” scope.');
+  if (!res.ok) throw new Error(`GitHub error ${res.status}`);
+  return res.json();
+}
+async function findGist() {
+  for (let page = 1; page <= 3; page++) {
+    const list = await gh(`/gists?per_page=100&page=${page}`);
+    const g = list.find((x) => x.files && x.files[GIST_FILE]);
+    if (g) return g.id;
+    if (list.length < 100) break;
+  }
+  return '';
+}
+async function pullRemote() {
+  const g = await gh(`/gists/${sync.gistId}`), f = g.files[GIST_FILE];
+  if (!f) return null;
+  return JSON.parse(f.truncated ? await (await fetch(f.raw_url)).text() : f.content);
+}
+async function pushRemote() {
+  const files = { [GIST_FILE]: { content: JSON.stringify(state) } };
+  if (sync.gistId) await gh(`/gists/${sync.gistId}`, { method: 'PATCH', body: JSON.stringify({ files }) });
+  else sync.gistId = (await gh('/gists', { method: 'POST', body: JSON.stringify({ description: 'Forge backup (workouts & food log). Private.', public: false, files }) })).id;
+}
+const localIsEmpty = () => !state.workouts.length && !Object.keys(state.diary).some(dayHasFood) && !state.active;
+let syncing = false, syncAgain = false, syncT = 0;
+function scheduleSync() { if (!sync.token) return; clearTimeout(syncT); syncT = setTimeout(() => syncNow(), 4000); }
+async function syncNow() {
+  if (!sync.token || !navigator.onLine) return;
+  if (syncing) { syncAgain = true; return; }
+  syncing = true; paintSync('Syncing…');
+  try {
+    if (!sync.gistId) sync.gistId = await findGist();
+    const remote = sync.gistId ? await pullRemote() : null;
+    const rU = remote?.meta?.updatedAt || 0, lU = state.meta.updatedAt || 0;
+    const remoteChanged = rU > sync.lastSyncedAt && rU !== lU, localChanged = lU > sync.lastSyncedAt;
+    let adopt = false;
+    if (remote && remoteChanged) {
+      adopt = !localChanged || localIsEmpty()
+        || confirm(`Both this device and your cloud backup have changes.\n\nCloud copy: saved ${ago(rU)}\nThis device: changed ${ago(lU)}\n\nOK = use the cloud copy here.\nCancel = keep this device and overwrite the cloud.`);
+    }
+    if (adopt) {
+      state = hydrate(remote); save(false); render(false);
+      toast('☁️ Synced from your cloud backup');
+    } else if (localChanged || !remote) await pushRemote();
+    sync.lastSyncedAt = state.meta.updatedAt; sync.lastOkAt = Date.now(); sync.error = '';
+  } catch (e) {
+    sync.error = navigator.onLine ? (e.message || 'Sync failed') : 'Offline. Will sync when you’re back online.';
+  } finally {
+    saveSync(); syncing = false; paintSync();
+    if (syncAgain) { syncAgain = false; scheduleSync(); }
+  }
+}
+function paintSync(msg) {
+  const el = $('#syncStatus'); if (!el) return;
+  el.textContent = msg || (sync.error ? '⚠️ ' + sync.error : sync.token ? `✅ Cloud backup on · last synced ${ago(sync.lastOkAt)}` : 'Off');
+}
+addEventListener('online', () => scheduleSync());
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && sync.token && Date.now() - sync.lastOkAt > 60000) syncNow();
+  if (document.visibilityState === 'hidden' && sync.token && state.meta.updatedAt > sync.lastSyncedAt) syncNow();
+});
+
+const LAST_EXPORT = 'forge:lastExport';
+const lastExport = () => { try { return +localStorage.getItem(LAST_EXPORT) || 0; } catch { return 0; } };
+async function shareBackup() {
+  const name = `forge-backup-${dkey()}.json`, text = JSON.stringify(state, null, 2);
+  const file = new File([text], name, { type: 'application/json' });
+  try {
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file], title: 'Forge backup' });
+    } else {
+      const a = document.createElement('a'); a.href = URL.createObjectURL(file); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    }
+    localStorage.setItem(LAST_EXPORT, Date.now()); toast('Backup saved');
+  } catch (e) { if (e.name !== 'AbortError') toast('Couldn’t save the backup'); }
+}
+function importBackup() {
+  const inp = document.createElement('input'); inp.type = 'file'; inp.accept = 'application/json,.json';
+  inp.onchange = async () => {
+    try {
+      const data = JSON.parse(await inp.files[0].text());
+      if (!data || !Array.isArray(data.workouts)) throw 0;
+      if (!confirm('Replace all current data with this backup?')) return;
+      state = hydrate(data); state.meta.updatedAt = Date.now(); save(); closeSheet(); render(); toast('Backup restored');
+    } catch { toast('That file isn’t a Forge backup'); }
+  };
+  inp.click();
+}
+
+function backupSheet() {
+  const connected = !!sync.token;
+  openSheet(`<h2>Backup & sync</h2>
+    <section class="card" style="margin-bottom:12px">
+      <div class="meal-head"><h3>☁️ Cloud backup</h3><span class="chip ${connected ? 'accent' : ''}">${connected ? 'On' : 'Off'}</span></div>
+      <p class="muted" style="font-size:13px;margin:0 0 10px">Saves everything to a <b>private</b> gist on your GitHub account, automatically. Use the same token on another phone and it picks up all your data.</p>
+      <p id="syncStatus" style="font-size:13px;margin:0 0 10px"></p>
+      ${connected ? `<div class="row"><button class="btn" id="syncGo">Sync now</button><button class="btn danger" id="syncOff">Turn off</button></div>`
+        : `<ol class="cues" style="margin-top:0">
+            <li><a class="link" href="https://github.com/settings/tokens/new?scopes=gist&description=Forge%20backup" target="_blank" rel="noopener">Open GitHub token page ↗</a>. Signed in, the <b>gist</b> box is already ticked.</li>
+            <li>Set <b>Expiration</b> to “No expiration”, scroll down, tap <b>Generate token</b>, and copy it.</li>
+            <li>Paste it below. It stays on this device only.</li>
+          </ol>
+          <div class="field"><label>GitHub token</label><input id="tok" type="password" autocomplete="off" placeholder="ghp_…"></div>
+          <button class="btn primary block" id="syncOn">Turn on cloud backup</button>`}
+    </section>
+    <section class="card">
+      <div class="meal-head"><h3>📦 Backup file</h3><small class="muted">last: ${ago(lastExport())}</small></div>
+      <p class="muted" style="font-size:13px;margin:0 0 10px">Send a backup file to WhatsApp, Drive or email. Restore it on any device.</p>
+      <div class="row"><button class="btn" id="bkShare">Save / share backup</button><button class="btn" id="bkImport">Restore from file</button></div>
+    </section>`, (b) => {
+    paintSync();
+    const on = $('#syncOn', b);
+    if (on) on.onclick = async () => {
+      const t = $('#tok', b).value.trim();
+      if (!/^(ghp_|github_pat_|gho_)/.test(t)) return toast('That doesn’t look like a GitHub token');
+      sync = { token: t, gistId: '', lastSyncedAt: 0, lastOkAt: 0, error: '' }; saveSync();
+      on.disabled = true; on.textContent = 'Connecting…';
+      await syncNow();
+      if (sync.error) { toast(sync.error); sync.token = ''; saveSync(); on.disabled = false; on.textContent = 'Turn on cloud backup'; return; }
+      confetti(80, 0.4); toast('☁️ Cloud backup is on'); backupSheet();
+    };
+    const go = $('#syncGo', b); if (go) go.onclick = () => syncNow();
+    const off = $('#syncOff', b);
+    if (off) off.onclick = () => { if (confirm('Turn off cloud backup on this device? Your gist stays on GitHub.')) { sync = { token: '', gistId: '', lastSyncedAt: 0, lastOkAt: 0, error: '' }; saveSync(); backupSheet(); } };
+    $('#bkShare', b).onclick = shareBackup;
+    $('#bkImport', b).onclick = importBackup;
+  });
+}
+
+/* ---------- reminders ---------- */
+const DAYS = ['MO', 'TU', 'WE', 'TH', 'FR', 'SA', 'SU'];
+const DAY_LABEL = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+const toMin = (t) => { const [h, m] = t.split(':').map(Number); return h * 60 + m; };
+const todayIdx = () => (new Date().getDay() + 6) % 7;
+let swReg = null;
+async function notify(title, body, tag) {
+  if ('Notification' in window && Notification.permission === 'granted') {
+    try { if (swReg) { await swReg.showNotification(title, { body, tag, icon: 'icon-192.png', badge: 'icon-192.png' }); return; } } catch { /* fall through */ }
+    try { new Notification(title, { body, tag, icon: 'icon-192.png' }); return; } catch { /* fall through */ }
+  }
+  toast(`${title}: ${body}`);
+}
+function checkReminders() {
+  const r = state.reminders, now = new Date(), nowM = now.getHours() * 60 + now.getMinutes(), k = dkey();
+  let sent = {}; try { sent = JSON.parse(localStorage.getItem('forge:remSent')) || {}; } catch { /* ignore */ }
+  if (sent.date !== k) sent = { date: k, keys: [] };
+  const due = (t) => t && nowM >= toMin(t) && nowM - toMin(t) <= 120;
+  const fire = (key, title, body) => { if (sent.keys.includes(key)) return; sent.keys.push(key); notify(title, body, key); };
+  if (r.days.includes(todayIdx()) && due(r.time) && !workoutDays().has(k) && !state.active) {
+    const n = nextRoutine(); fire('train', 'Time to train 💪', n ? `Up next: ${n.name}. Tap to start.` : 'Tap to start a workout.');
+  }
+  if (due(r.foodTime) && totals(peekDay(k)).kcal < targets().kcal * 0.5) fire('food', 'Log your food 🍽️', 'Quick check-in: what did you eat today?');
+  try { localStorage.setItem('forge:remSent', JSON.stringify(sent)); } catch { /* ignore */ }
+}
+setInterval(checkReminders, 30000);
+
+function remindersIcs() {
+  const r = state.reminders, pad2 = (n) => String(n).padStart(2, '0');
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+/, '');
+  const at = (t, d = new Date()) => { const [h, m] = t.split(':'); return `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}T${pad2(h)}${pad2(m)}00`; };
+  const ev = (uid, summary, desc, start, rule) => ['BEGIN:VEVENT', `UID:${uid}@forge`, `DTSTAMP:${stamp}`, `DTSTART:${start}`, 'DURATION:PT15M', `RRULE:${rule}`, `SUMMARY:${summary}`, `DESCRIPTION:${desc}`,
+    'BEGIN:VALARM', 'ACTION:DISPLAY', `DESCRIPTION:${summary}`, 'TRIGGER:PT0M', 'END:VALARM', 'END:VEVENT'];
+  const lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Forge//Reminders//EN', 'CALSCALE:GREGORIAN'];
+  if (r.days.length && r.time) {
+    let d = new Date(); while (!r.days.includes((d.getDay() + 6) % 7)) d = addDays(d, 1);
+    lines.push(...ev('forge-train', 'Forge: time to train 💪', 'Open Forge and start your workout.', at(r.time, d), `FREQ=WEEKLY;BYDAY=${[...r.days].sort().map((i) => DAYS[i]).join(',')}`));
+  }
+  if (r.foodTime) lines.push(...ev('forge-food', 'Forge: log your food 🍽️', 'Quick check-in in Forge.', at(r.foodTime), 'FREQ=DAILY'));
+  lines.push('END:VCALENDAR');
+  return lines.join('\r\n');
+}
+function remindersSheet() {
+  const r = { ...state.reminders, days: [...state.reminders.days] };
+  const permText = () => !('Notification' in window) ? 'This browser can’t show notifications. Use the calendar button for reminders.'
+    : Notification.permission === 'granted' ? '✅ Notifications on. They show while Forge is open. Add them to your calendar to get them anytime.'
+    : Notification.permission === 'denied' ? 'Notifications are blocked for this site. Use the calendar button instead.'
+    : 'Tap Save and we’ll ask to send notifications.';
+  openSheet(`<h2>Reminders</h2>
+    <div class="field"><label>Training days</label><div class="days" id="rDays">${DAY_LABEL.map((d, i) => `<button data-d="${i}" class="${r.days.includes(i) ? 'on' : ''}">${d[0]}</button>`).join('')}</div></div>
+    <div class="row"><div class="field"><label>Training reminder time</label><input id="rTime" type="time" value="${r.time}"></div>
+    <div class="field"><label>Food-log nudge (optional)</label><input id="rFood" type="time" value="${r.foodTime}"></div></div>
+    <p class="muted" style="font-size:12.5px" id="rPerm"></p>
+    <button class="btn primary block" id="rSave">Save reminders</button>
+    <button class="btn block" id="rCal" style="margin-top:8px">📅 Add to my phone’s calendar</button>
+    <p class="muted" style="font-size:12px">The calendar option works even when Forge is closed. Your calendar app does the alerting.</p>`, (b) => {
+    $('#rPerm', b).textContent = permText();
+    $('#rDays', b).onclick = (e) => { const x = e.target.closest('[data-d]'); if (!x) return; const d = +x.dataset.d; r.days = r.days.includes(d) ? r.days.filter((y) => y !== d) : [...r.days, d]; x.classList.toggle('on'); };
+    const read = () => { r.time = $('#rTime', b).value || '17:30'; r.foodTime = $('#rFood', b).value || ''; };
+    $('#rSave', b).onclick = async () => {
+      read(); state.reminders = r; save();
+      if ((r.days.length || r.foodTime) && 'Notification' in window && Notification.permission === 'default') { try { await Notification.requestPermission(); } catch { /* ignore */ } }
+      closeSheet(); toast(r.days.length || r.foodTime ? '🔔 Reminders saved' : 'Reminders off');
+    };
+    $('#rCal', b).onclick = () => {
+      read(); state.reminders = r; save();
+      if (!r.days.length && !r.foodTime) return toast('Pick training days or a food time first');
+      const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([remindersIcs()], { type: 'text/calendar' })); a.download = 'forge-reminders.ics'; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1500);
+      toast('Calendar file saved. Open it to add the reminders.');
+    };
+  });
+}
+
 /* ---------- profile / onboarding ---------- */
 function profileSheet(first = false) {
   const p = state.profile || { name: '', sex: 'm', age: 28, height: 175, weight: latestWeight() || 75, activity: 1.55, goal: 'maintain', rate: 0.5 };
@@ -863,10 +1289,21 @@ function profileSheet(first = false) {
     <div class="field"><label>Goal</label><div class="seg" data-k="goal"><button data-v="cut">Lose fat</button><button data-v="maintain">Maintain</button><button data-v="bulk">Build muscle</button></div></div>
     <div class="field" id="rateF"><label>Rate (kg per week)</label><div class="seg" data-k="rate"><button data-v="0.25">0.25</button><button data-v="0.5">0.5</button><button data-v="0.75">0.75</button></div></div>
     <div class="field"><label>Rest timer</label><div class="seg" data-k="rest"><button data-v="60">1:00</button><button data-v="90">1:30</button><button data-v="120">2:00</button><button data-v="180">3:00</button></div></div>
+    <div class="field"><label>Suggest a deload week after</label><div class="seg" data-k="deload"><button data-v="0">Never</button><button data-v="4">4 wks</button><button data-v="6">6 wks</button><button data-v="8">8 wks</button></div></div>
     <section class="card" id="pPrev" style="margin:4px 0 14px"></section>
     <button class="btn primary block" id="pGo">${first ? 'Let’s go' : 'Save'}</button>
-    ${first ? '' : '<button class="btn danger block" id="pReset" style="margin-top:8px;background:none;border-color:transparent">Erase all data</button>'}`, (b) => {
-    const segs = { sex: d.sex, goal: d.goal, rate: String(d.rate), rest: String(state.settings.restSec) };
+    ${first ? '' : `<div class="row" style="margin-top:8px"><button class="btn" id="pBk">☁️ Backup</button><button class="btn" id="pRem">🔔 Reminders</button></div>
+      <button class="btn block" id="pDeload" style="margin-top:8px">${deloadActive() ? '🧘 End deload week' : '🧘 Start a deload week now'}</button>
+      <button class="btn danger block" id="pReset" style="margin-top:8px;background:none;border-color:transparent">Erase all data</button>`}`, (b) => {
+    const segs = { sex: d.sex, goal: d.goal, rate: String(d.rate), rest: String(state.settings.restSec), deload: String(state.settings.deloadEvery) };
+    const bk = $('#pBk', b); if (bk) bk.onclick = backupSheet;
+    const rem = $('#pRem', b); if (rem) rem.onclick = remindersSheet;
+    const dl = $('#pDeload', b);
+    if (dl) dl.onclick = () => {
+      if (deloadActive()) { state.settings.deloadUntil = 0; state.settings.deloadDismissed = Date.now(); toast('Deload ended'); }
+      else { state.settings.deloadUntil = Date.now() + 7 * 864e5; toast('🧘 Deload week started'); }
+      save(); closeSheet(); render(false);
+    };
     const read = () => ({ name: $('#pN', b).value.trim(), sex: segs.sex, age: num($('#pA', b).value), height: num($('#pH', b).value), weight: num($('#pW', b).value), activity: num($('#pAct', b).value), goal: segs.goal, rate: num(segs.rate) });
     const preview = () => {
       $$('.seg', b).forEach((s) => $$('button', s).forEach((x) => x.classList.toggle('on', x.dataset.v === segs[s.dataset.k])));
@@ -880,12 +1317,17 @@ function profileSheet(first = false) {
     $('#pGo', b).onclick = () => {
       const np = read();
       if (!(np.age >= 13 && np.age <= 100 && np.height >= 120 && np.height <= 230 && np.weight >= 30 && np.weight <= 300)) return toast('Check age, height and weight');
-      state.profile = np; state.settings.restSec = +segs.rest;
+      state.profile = np; state.settings.restSec = +segs.rest; state.settings.deloadEvery = +segs.deload;
       if (!state.weights.length || first) state.weights = state.weights.filter((x) => x.date !== dkey()).concat({ date: dkey(), kg: np.weight });
       save(); closeSheet(); render(); if (first) { confetti(120); toast('Targets set — welcome!'); } else toast('Saved');
     };
     const reset = $('#pReset', b);
-    if (reset) reset.onclick = () => { if (confirm('Erase ALL workouts, food logs and settings? This cannot be undone.')) { state = blank(); save(); closeSheet(); setTimeout(() => profileSheet(true), 300); render(); } };
+    if (reset) reset.onclick = () => {
+      if (!confirm(`Erase ALL workouts, food logs and settings on this device? This cannot be undone.${sync.token ? '\n\nCloud backup will be turned off here first, so your cloud copy stays safe.' : ''}`)) return;
+      // Disconnect sync first so an empty state never overwrites the cloud copy.
+      sync = { token: '', gistId: '', lastSyncedAt: 0, lastOkAt: 0, error: '' }; saveSync();
+      state = blank(); save(); closeSheet(); setTimeout(() => profileSheet(true), 300); render();
+    };
     preview();
   });
 }
@@ -896,4 +1338,10 @@ $('#todayLabel').textContent = fmtDate(new Date(), { weekday: 'long', day: 'nume
 moveIndicator();
 render();
 if (!state.profile) setTimeout(() => profileSheet(true), 400);
-if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => {});
+if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+  navigator.serviceWorker.register('sw.js').then((r) => { swReg = r; }).catch(() => {});
+}
+// Ask the browser not to evict our storage under pressure (Android/Chrome honour this).
+try { navigator.storage?.persist?.(); } catch { /* ignore */ }
+if (sync.token) setTimeout(syncNow, 800);
+setTimeout(checkReminders, 2000);

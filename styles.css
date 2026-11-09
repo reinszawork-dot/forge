@@ -313,6 +313,52 @@ h1, h2, h3 { font-family: var(--display); margin: 0; letter-spacing: -0.01em; }
 .summary-stats b { display: block; font: 700 22px var(--display); }
 .summary-stats span { font-size: 12px; color: var(--muted); }
 
+/* --- Phone fixes: iOS zooms into inputs under 16px; keep text size stable --- */
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+input, select, textarea { font-size: 16px; }
+.sheet { overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+button, .item { touch-action: manipulation; }
+
+/* Effort (RPE) + guides */
+.feel { width: 32px; height: 36px; border-radius: 10px; background: var(--line); font-size: 17px; line-height: 1; color: var(--muted); }
+.feel.bump { animation: pop .35s var(--spring); }
+.sets th:nth-child(5), .sets td:nth-child(5) { width: 36px; }
+.sets input { max-width: 64px; }
+.info-btn {
+  display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; margin-left: 4px; vertical-align: 2px;
+  font: italic 700 13px/1 Georgia, serif; color: var(--accent); border: 1.5px solid currentColor; flex: none; transition: transform .2s var(--spring);
+}
+.info-btn:active { transform: scale(.85); }
+.item .info-btn { width: 30px; height: 30px; font-size: 15px; }
+.suggest.deload { color: var(--protein); }
+.suggest.easy { color: var(--carbs); }
+.suggest.stall { color: var(--kcal); }
+.on-soft { background: color-mix(in srgb, var(--carbs) 22%, transparent); border-color: var(--carbs); }
+.cues { padding-left: 22px; margin: 6px 0 12px; display: flex; flex-direction: column; gap: 10px; }
+.cues li { padding-left: 4px; animation: rise .45s var(--ease) both; animation-delay: calc(var(--i, 0) * 80ms); }
+.cues li::marker { color: var(--accent); font-weight: 700; font-family: var(--display); }
+.mistake { padding: 12px 14px; border-radius: 14px; font-size: 14px; background: color-mix(in srgb, var(--kcal) 12%, transparent); border: 1px solid color-mix(in srgb, var(--kcal) 35%, transparent); }
+
+/* Deload / nudge banners */
+.banner { display: flex; align-items: center; gap: 12px; }
+.banner .grow { flex: 1; min-width: 0; }
+.pulse-border { animation: glow 2.4s ease-in-out infinite; }
+@keyframes glow { 50% { border-color: var(--accent); box-shadow: 0 0 24px -8px var(--accent); } }
+
+/* Barcode scanner */
+.scan-box { position: relative; aspect-ratio: 4 / 3; border-radius: 18px; overflow: hidden; background: #000; }
+.scan-box video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.scan-box::after { content: ''; position: absolute; inset: 18% 12%; border: 2px solid rgba(255,255,255,.75); border-radius: 14px; box-shadow: 0 0 0 999px rgba(0,0,0,.35); pointer-events: none; }
+.scan-line { position: absolute; left: 14%; right: 14%; height: 2px; top: 20%; z-index: 1; background: var(--kcal); box-shadow: 0 0 12px 2px var(--kcal); animation: scan 2s ease-in-out infinite alternate; }
+@keyframes scan { to { top: 80%; } }
+.scan-msg { position: absolute; left: 12px; right: 12px; bottom: 12px; z-index: 2; text-align: center; padding: 8px 10px; border-radius: 10px; background: rgba(0,0,0,.65); color: #fff; font-size: 13px; }
+
+/* Reminder day picker */
+.days { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; }
+.days button { aspect-ratio: 1; border-radius: 12px; background: var(--card-solid); border: 1px solid var(--line); font-weight: 700; transition: background .2s, transform .25s var(--spring); }
+.days button.on { background: var(--accent); color: var(--accent-ink); border-color: transparent; transform: scale(1.06); }
+.seg button { font-size: 13px; }
+
 @media (max-width: 420px) {
   .hero { grid-template-columns: 124px 1fr; }
   .ring { width: 124px; height: 124px; }

@@ -18,10 +18,16 @@ The design pulls the best ideas from the top apps in each category:
 
 ## Features
 - **Train:** routines (Push/Pull/Legs/Full Body included), a 44-exercise library + custom exercises, rest timer with sound/vibration, live workout timer, PR detection (Epley e1RM), history, and repeating a past workout
-- **Eat:** breakfast/lunch/dinner/snacks, a built-in food list with SA staples (pap, boerewors, biltong, chakalaka…), recent foods, quick add, custom foods, online search via Open Food Facts, and a water tracker
+- **Smart progression:** double progression (8→12 reps, then add load), tuned by per-set effort ratings (RPE 😌🙂😤💀). It detects stalls after 3 flat sessions, suggests a deload week every 4/6/8 training weeks, and has a "rough day" mode.
+- **Exercise guides:** form cues, muscles worked, the most common mistake, a form-video link, and your own stats for every exercise
+- **Eat:** breakfast/lunch/dinner/snacks, a built-in food list with SA staples (pap, boerewors, biltong, chakalaka…), recent foods, quick add, custom foods, and a water tracker
+- **Barcode scanning:** uses the native BarcodeDetector where available, with a ZXing fallback for iPhone and manual number entry. Lookups go to Open Food Facts.
+- **Online food search:** South African products first, with automatic retry when Open Food Facts is rate-limiting
 - **Progress:** weight trend, 14-day calories vs target, muscle sets heat map, weekly volume, e1RM chart per lift, and a PR leaderboard
-- **Animations:** animated calorie ring and count-ups, sliding tab indicator, spring sheets, confetti, set-tick animations, a pulsing rest timer, and drifting ambient background. Motion is reduced when the OS asks for it.
-- JSON export/import backup
+- **Backup & sync:** automatic cloud backup to a *private* GitHub Gist (token stays on-device) with conflict handling across devices. You can also share a backup file to WhatsApp/Drive/email and restore from it.
+- **Reminders:** training days + time and a food-log nudge, shown as notifications while the app is open and exportable to your phone's calendar (.ics) for when it's closed
+- **Animations:** animated calorie ring and count-ups, sliding tab indicator, spring sheets, confetti, set-tick animations, a pulsing rest timer, a scanning laser, and drifting ambient background. Motion is reduced when the OS asks for it.
+- **Phone-ready:** PNG home-screen icons for iOS/Android, 16px inputs (no iOS zoom), offline caching
 
 ## Run locally
 It's static files, so you can serve the folder with any web server, e.g.

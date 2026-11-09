@@ -1,6 +1,16 @@
 /* Forge service worker: offline app shell. */
-const VERSION = 'forge-v1';
-const SHELL = ['./', 'index.html', 'styles.css', 'data.js', 'app.js', 'manifest.webmanifest', 'icon.svg'];
+const VERSION = 'forge-v2';
+const SHELL = ['./', 'index.html', 'styles.css', 'data.js', 'app.js', 'manifest.webmanifest', 'icon.svg', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];
+
+// Reminder notification tapped: focus Forge (or open it).
+self.addEventListener('notificationclick', (e) => {
+  e.notification.close();
+  e.waitUntil((async () => {
+    const wins = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    if (wins.length) return wins[0].focus();
+    return self.clients.openWindow(self.registration.scope);
+  })());
+});
 const FONT_HOSTS = ['fonts.googleapis.com', 'fonts.gstatic.com'];
 
 self.addEventListener('install', (e) => {
@@ -29,7 +39,11 @@ self.addEventListener('fetch', (e) => {
     }).catch(() => new Response('', { status: 504 })));
     return;
   }
-  if (url.origin !== location.origin) return; // e.g. Open Food Facts — always live
+  if (url.hostname === 'cdn.jsdelivr.net') { // barcode library: cache-first so scanning works offline after first use
+    e.respondWith(caches.open(VERSION).then(async (c) => (await c.match(req)) || fetch(req).then((res) => { if (res.ok) c.put(req, res.clone()); return res; })));
+    return;
+  }
+  if (url.origin !== location.origin) return; // e.g. Open Food Facts, GitHub — always live
 
   // Network-first so updates show immediately; cache for offline.
   e.respondWith((async () => {
