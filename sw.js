@@ -1,5 +1,5 @@
 /* Forge service worker: offline app shell. */
-const VERSION = 'forge-v2';
+const VERSION = 'forge-v3';
 const SHELL = ['./', 'index.html', 'styles.css', 'data.js', 'app.js', 'manifest.webmanifest', 'icon.svg', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];
 
 // Reminder notification tapped: focus Forge (or open it).
@@ -46,10 +46,12 @@ self.addEventListener('fetch', (e) => {
   if (url.origin !== location.origin) return; // e.g. Open Food Facts, GitHub — always live
 
   // Network-first so updates show immediately; cache for offline.
+  // no-cache = revalidate with the server, so GitHub Pages' 10-minute HTTP cache can never
+  // hand us a mix of old and new files after an update.
   e.respondWith((async () => {
     const c = await caches.open(VERSION);
     try {
-      const res = await fetch(req);
+      const res = await fetch(req.mode === 'navigate' ? req.url : req, { cache: 'no-cache' });
       if (res.ok) c.put(req, res.clone());
       return res;
     } catch {
